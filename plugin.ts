@@ -1228,7 +1228,7 @@ async function* streamFromGateway(options: GatewayOptions, accountId: string): A
     method: 'POST',
     headers,
     body: JSON.stringify({
-      model: 'default',
+      model: 'main',
       messages,
       stream: true,
       user: sessionKey,  // 用于 session 持久化
@@ -2317,6 +2317,16 @@ async function handleDingTalkMessage(params: {
 
   log?.info?.(`[DingTalk] 收到消息: from=${senderName} type=${content.messageType} text="${content.text.slice(0, 50)}..." images=${content.imageUrls.length} downloadCodes=${content.downloadCodes.length}`);
 
+  // ===== DM Policy 检查 =====
+  if (isDirect) {
+    const dmPolicy = dingtalkConfig.dmPolicy || 'open';
+    const allowFrom: string[] = dingtalkConfig.allowFrom || [];
+    if (dmPolicy === 'allowlist' && allowFrom.length > 0 && !allowFrom.includes(senderId)) {
+      log?.warn?.(`[DingTalk] DM 被拦截: senderId=${senderId} 不在 allowFrom 白名单中`);
+      return;
+    }
+  }
+
   // ===== Session 管理 =====
   const sessionTimeout = dingtalkConfig.sessionTimeout ?? 1800000; // 默认 30 分钟
   const forceNewSession = isNewSessionCommand(content.text);
@@ -2459,6 +2469,82 @@ async function handleDingTalkMessage(params: {
     userContent = userContent ? `${userContent}\n\n${fileText}` : fileText;
   }
   if (!userContent && imageLocalPaths.length === 0) return;
+
+  // ===== 异步模式：立即回执 + 后台执行 + 主动推送结果 =====
+  const asyncMode = dingtalkConfig.asyncMode === true;
+  const proactiveTarget = isDirect
+    ? { userId: data.senderStaffId || data.senderId }
+    : { openConversationId: data.conversationId };
+
+  if (asyncMode) {
+    const ackText = dingtalkConfig.ackText || '🫡 任务已接收，处理中...';
+    try {
+      await sendProactive(dingtalkConfig, proactiveTarget, ackText, {
+        msgType: 'text',
+        useAICard: false,
+        fallbackToNormal: true,
+        log,
+      });
+    } catch (ackErr: any) {
+      log?.warn?.(`[DingTalk][Async] 回执发送失败: ${ackErr?.message || ackErr}`);
+    }
+
+    let fullResponse = '';
+    try {
+      for await (const chunk of streamFromGateway({
+        userContent: content.text,
+        systemPrompts,
+        sessionKey,
+        gatewayAuth,
+        imageLocalPaths: imageLocalPaths.length > 0 ? imageLocalPaths : undefined,
+        log,
+      })) {
+        fullResponse += chunk;
+      }
+
+      log?.info?.(`[DingTalk][Async] Gateway 完成，原始长度=${fullResponse.length}`);
+
+      // 后处理01：上传本地图片到钉钉，替换 file:// 路径为 media_id
+      fullResponse = await processLocalImages(fullResponse, oapiToken, log);
+
+      // 后处理02：提取视频标记并发送视频消息（主动 API）
+      const proactiveMediaTarget: AICardTarget = isDirect
+        ? { type: 'user', userId: data.senderStaffId || data.senderId }
+        : { type: 'group', openConversationId: data.conversationId };
+      fullResponse = await processVideoMarkers(fullResponse, '', dingtalkConfig, oapiToken, log, true, proactiveMediaTarget);
+
+      // 后处理03：提取音频标记并发送音频消息（主动 API）
+      fullResponse = await processAudioMarkers(fullResponse, '', dingtalkConfig, oapiToken, log, true, proactiveMediaTarget);
+
+      // 后处理04：提取文件标记并发送独立文件消息（主动 API）
+      fullResponse = await processFileMarkers(fullResponse, '', dingtalkConfig, oapiToken, log, true, proactiveMediaTarget);
+
+      const finalText = fullResponse.trim() || '✅ 任务执行完成（无文本输出）';
+      await sendProactive(dingtalkConfig, proactiveTarget, finalText, {
+        msgType: 'markdown',
+        useAICard: false,
+        fallbackToNormal: true,
+        log,
+      });
+
+      log?.info?.(`[DingTalk][Async] 结果已主动推送，长度=${finalText.length}`);
+    } catch (err: any) {
+      const errMsg = `⚠️ 任务执行失败: ${err?.message || err}`;
+      log?.error?.(`[DingTalk][Async] ${errMsg}`);
+      try {
+        await sendProactive(dingtalkConfig, proactiveTarget, errMsg, {
+          msgType: 'text',
+          useAICard: false,
+          fallbackToNormal: true,
+          log,
+        });
+      } catch (sendErr: any) {
+        log?.error?.(`[DingTalk][Async] 错误通知发送失败: ${sendErr?.message || sendErr}`);
+      }
+    }
+
+    return;
+  }
 
   // 尝试创建 AI Card
   const card = await createAICard(dingtalkConfig, data, log);
@@ -2939,6 +3025,8 @@ const dingtalkPlugin = {
         gatewayToken: { type: 'string', default: '', description: 'Gateway auth token (Bearer)' },
         gatewayPassword: { type: 'string', default: '', description: 'Gateway auth password (alternative to token)' },
         sessionTimeout: { type: 'number', default: 1800000, description: 'Session timeout in ms (default 30min)' },
+        asyncMode: { type: 'boolean', default: false, description: 'Send immediate ack and push final result as a second message' },
+        ackText: { type: 'string', default: '🫡 任务已接收，处理中...', description: 'Ack text when asyncMode is enabled' },
         debug: { type: 'boolean', default: false },
       },
       required: ['clientId', 'clientSecret'],
