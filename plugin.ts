@@ -3277,13 +3277,15 @@ const dingtalkPlugin = {
 
       ctx.log?.info(`[${account.accountId}] 启动钉钉 Stream 客户端...`);
 
-      // 【关键】禁用 DWClient 内置的 autoReconnect，由框架的 health-monitor 统一管理重连
-      // 否则会导致双重重连机制冲突，出现频繁重连的问题
+      // 启用 DWClient 内置的 autoReconnect 和 keepAlive
+      // - autoReconnect: 连接断开时自动重连
+      // - keepAlive: 启用心跳机制，防止服务端因长时间无活动而断开连接
       const client = new DWClient({
         clientId: config.clientId,
         clientSecret: config.clientSecret,
         debug: config.debug || false,
-        autoReconnect: false,  // 禁用内置重连，由框架管理
+        autoReconnect: true,
+        keepAlive: true,
       } as any);
 
       client.registerCallbackListener(TOPIC_ROBOT, async (res: any) => {
@@ -3349,13 +3351,20 @@ const dingtalkPlugin = {
         rt.channel.activity.record('dingtalk-connector', account.accountId, 'stop');
       };
 
-      if (abortSignal) {
-        abortSignal.addEventListener('abort', () => doStop('abortSignal'));
-      }
-
-      return {
-        stop: () => doStop('manual'),
-      };
+      // 【关键修复】返回一个 Promise 并保持 pending 状态直到 abortSignal 触发
+      // 这样框架不会认为账号已退出，避免触发 auto-restart
+      // 参考：OpenClaw changelog - "keep startAccount pending until abort to prevent restart-loop storms"
+      return new Promise((resolve) => {
+        if (abortSignal) {
+          abortSignal.addEventListener('abort', () => {
+            doStop('abortSignal');
+            resolve({
+              stop: () => doStop('manual'),
+              isHealthy: () => !stopped,
+            });
+          });
+        }
+      });
     },
   },
   status: {
